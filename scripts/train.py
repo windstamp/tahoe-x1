@@ -122,6 +122,13 @@ def main(cfg: DictConfig) -> composer.Trainer:
         default_value=None,
         convert=True,
     )
+    profiling_config: Optional[Dict[str, Any]] = pop_config(
+        cfg,
+        "profiling",
+        must_exist=False,
+        default_value=None,
+        convert=True,
+    )
 
     # Optional logging, evaluation and callback configs
     logger_configs: Optional[DictConfig] = pop_config(
@@ -461,6 +468,10 @@ def main(cfg: DictConfig) -> composer.Trainer:
             collator_config=collator_config,
         )
 
+    import sys
+    print(f"{__file__}:{sys._getframe().f_lineno}")
+    print(model)
+
     # Log number of parameters
     n_params = sum(p.numel() for p in model.parameters())
     n_trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -478,6 +489,94 @@ def main(cfg: DictConfig) -> composer.Trainer:
     # Optimizer
     optimizer_name: str = optimizer_config.pop("name")
     optimizer = build_optimizer(model, optimizer_name, optimizer_config)
+
+    # Setup profiling if enabled
+    enable_profiling = profiling_config.get("enabled", False) if profiling_config else False
+    hook_dict: Dict[str, Any] = {}
+    hooks = []
+    prof = None
+    profiling_dir: Optional[str] = None
+
+    if enable_profiling:
+        profiling_dir = profiling_config.get(
+            "output_dir",
+            os.path.join(os.getcwd(), "profiling", run_name or "run"),
+        )
+        os.makedirs(profiling_dir, exist_ok=True)
+        repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+        if repo_root not in sys.path:
+            sys.path.insert(0, repo_root)
+        try:
+            from profile_utils import register_hooks
+
+            hooks = register_hooks(model, hook_dict)
+            log.info("="*80)
+            log.info("Profiling Enabled")
+            log.info("="*80)
+            log.info(f"Registered {len(hooks)} hooks for layer profiling")
+            log.info(f"Output: {profiling_dir}/")
+            log.info("="*80)
+        except ImportError as e:
+            log.warning(f"Profiling disabled: could not import profile_utils ({e})")
+            enable_profiling = False
+
+    if enable_profiling:
+        from torch.profiler import ProfilerActivity, profile, schedule
+
+        wait_steps = profiling_config.get("wait_steps", 1)
+        warmup_steps = profiling_config.get("warmup_steps", 1)
+        active_steps = profiling_config.get("active_steps", 3)
+
+        def trace_handler(p):
+            trace_file = os.path.join(profiling_dir, "trace.json")
+            try:
+                p.export_chrome_trace(trace_file)
+                log.info(f"\n{'='*80}")
+                log.info(f"Profiling trace auto-saved to: {trace_file}")
+                log.info(f"{'='*80}\n")
+            except Exception as e:
+                log.warning(f"Could not save trace: {e}")
+
+            if hook_dict:
+                hooks_file = os.path.join(profiling_dir, "layer_shapes.json")
+                try:
+                    import json
+
+                    with open(hooks_file, "w") as f:
+                        json.dump(hook_dict, f, indent=2, default=str)
+                    log.info(f"Layer shapes auto-saved to: {hooks_file}\n")
+                except Exception as e:
+                    log.warning(f"Could not save layer shapes: {e}")
+
+        prof_schedule = schedule(
+            wait=wait_steps,
+            warmup=warmup_steps,
+            active=active_steps,
+            repeat=1,
+        )
+
+        activities = [ProfilerActivity.CPU]
+        if torch.cuda.is_available():
+            activities.append(ProfilerActivity.CUDA)
+
+        prof = profile(
+            activities=activities,
+            schedule=prof_schedule,
+            record_shapes=True,
+            profile_memory=True,
+            with_stack=True,
+            on_trace_ready=trace_handler,
+        )
+        prof.start()
+
+        class ProfilerStepCallback(Callback):
+            def after_train_batch(self, state, logger):
+                if prof is not None:
+                    prof.step()
+                    if state.timestamp.batch.value == 0:
+                        log.info("Profiler step called for batch 0")
+
+        callbacks.insert(0, ProfilerStepCallback())
 
     # Build the Trainer
     log.info("Building Trainer...")
@@ -536,6 +635,69 @@ def main(cfg: DictConfig) -> composer.Trainer:
 
     log.info("Starting training...")
     trainer.fit()
+
+    if enable_profiling and prof is not None:
+        prof.stop()
+        if profiling_dir is None:
+            profiling_dir = os.path.join(os.getcwd(), "profiling", run_name or "run")
+        trace_file = os.path.join(profiling_dir, "trace.json")
+        hooks_file = os.path.join(profiling_dir, "layer_shapes.json")
+
+        trace_exists = os.path.exists(trace_file)
+        hooks_exist = os.path.exists(hooks_file)
+
+        if not trace_exists:
+            try:
+                prof.export_chrome_trace(trace_file)
+                log.info(f"Chrome trace saved (fallback): {trace_file}")
+            except Exception as e:
+                log.warning(f"Could not save Chrome trace: {e}")
+
+        if hook_dict and not hooks_exist:
+            try:
+                import json
+
+                with open(hooks_file, "w") as f:
+                    json.dump(hook_dict, f, indent=2, default=str)
+                log.info(f"Layer shapes saved (fallback): {hooks_file}")
+            except Exception as e:
+                log.warning(f"Could not save layer shapes: {e}")
+        
+        # Print summary of what was saved
+        if trace_exists or hooks_exist:
+            log.info(f"\n{'='*80}")
+            log.info(f"Profiling Results (auto-saved during training)")
+            log.info(f"{'='*80}")
+            if trace_exists:
+                log.info(f"Chrome trace: {trace_file}")
+            if hooks_exist:
+                log.info(f"Layer shapes: {hooks_file}")
+        else:
+            log.info(f"\n{'='*80}")
+            log.info(f"Profiling Results")
+            log.info(f"{'='*80}")
+            log.info(f"Chrome trace: {trace_file}")
+            if hook_dict:
+                log.info(f"Layer shapes: {hooks_file}")
+        
+        # Print profiler summary
+        try:
+            log.info(f"\nTop 10 operations by CPU time:")
+            log.info(prof.key_averages().table(sort_by="cpu_time_total", row_limit=10))
+            
+            if torch.cuda.is_available():
+                log.info(f"\nTop 10 operations by CUDA time:")
+                log.info(prof.key_averages().table(sort_by="cuda_time_total", row_limit=10))
+        except Exception as e:
+            log.warning(f"Could not print profiler summary: {e}")
+        
+        log.info(f"\nView Chrome trace at: chrome://tracing")
+        log.info(f"Analyze with: python analyze_tahoe_profile.py --profile_dir {profiling_dir}")
+        log.info(f"{'='*80}\n")
+
+        for hook in hooks:
+            hook.remove()
+
     log.info("Training finished.")
     return trainer
 

@@ -121,6 +121,14 @@ fsdp_config:
   limit_all_gathers: true
   verbose: true
 
+# Profiling
+profiling:
+  enabled: true
+  output_dir: ./profiling
+  wait_steps: 0
+  warmup_steps: 0
+  active_steps: 1
+
 # Logging
 progress_bar: false
 log_to_console: true
